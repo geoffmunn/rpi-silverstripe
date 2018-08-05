@@ -1,0 +1,193 @@
+---
+
+- name: Build a Silverstripe container
+  hosts: local
+
+  # These are the default values unless you change them via extra-vars (see README.md)
+  vars:
+    docker_container_name: silverstripe
+    docker_container_port: 8080
+
+  tasks:
+  - name: 1/26 Build the basic image
+    command: "docker run -t -d -p {{ docker_container_port }}:80 --name {{ docker_container_name }} resin/rpi-raspbian bash"
+    tags: os, build_container
+
+  - name: 2/26 Update and upgrade prior to getting Stretch
+    command: |
+      docker exec {{ docker_container_name }} bash -l -c 'apt-get update; apt-get upgrade -y'
+      docker exec {{ docker_container_name }} /bin/bash
+    tags: os
+
+  - name: 3/26 Copy the create user file over to the target
+    command: docker cp files/create_user.sh {{ docker_container_name }}:/tmp
+    tags: os
+
+  - name: 4/26 Make this file executable
+    command: docker exec {{ docker_container_name }} bash -l -c 'chmod +x /tmp/create_user.sh'
+    tags: os
+
+  - name: 5/26 Create the ansible user
+    command: docker exec {{ docker_container_name }} bash -l -c '/tmp/create_user.sh'
+    tags: os
+
+  - name: 6/26 Install python so Ansible will work
+    command: docker exec {{ docker_container_name }} bash -l -c 'apt-get install python'
+    tags: os
+
+  - name: 7/26 Update the sources
+    command: docker exec {{ docker_container_name }} bash -l -c 'sed -i -e 's/jessie/stretch/g' /etc/apt/sources.list; sed -i -e 's/jessie/stretch/g' /etc/apt/sources.list.d/raspi.list'
+    tags: os
+
+  - name: 8/26 Update and upgrade to Stretch (very slow - about 1 hour)
+    command: docker exec {{ docker_container_name }} bash -l -c 'apt-get update; apt-get dist-upgrade -y; apt-get autoremove -y'
+    tags: os
+
+  - name: 9/26 Install open-ssh so we can connect to it via ssh
+    command: docker exec {{ docker_container_name }} bash -l -c 'apt-get install openssh-server'
+    tags: os
+
+  - name: 10/26 Restart the docker image
+    command: docker restart {{ docker_container_name }}
+    tags: os
+
+  - name: 11/26 Start core services (including SSH)
+    command: docker exec {{ docker_container_name }} bash -c 'service {{ item }} start'
+    with_items:
+      - ssh
+    tags: software
+
+  - name: 12/26 Get the IP address of the new container and add it to the inventory
+    shell: "docker inspect -f {% raw %}'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'{% endraw %} {{ docker_container_name }}"
+    register: container_ip_address
+    tags: software
+
+  - name: 13/26 Add this to the inventory
+    add_host:
+      hostname: "silverstripe"
+      ansible_host: "{{ container_ip_address.stdout }}"
+      groups: "silverstripe_targets"
+    tags: software
+
+- name: Install the SilverStripe software
+  hosts: silverstripe_targets
+
+  tasks:
+
+  - name: 14/26 Install the core components
+    become: true
+    apt:
+      name: "{{ item }}"
+      state: present
+    with_items:
+      - nginx
+      - php7.0-fpm
+      - mysql-server
+    tags: software
+
+  - name: 15/26 Install the missing SilverStripe components
+    become: true
+    apt:
+      name: "{{ item }}"
+      state: present
+    with_items:
+      - php-gd
+      - php-xml
+      - php-mbstring
+      - php-simplexml
+      - php-tidy
+      - php-mysql
+      - php-curl
+    tags: software
+
+  - name: 16/26 Download SilverStripe and unzip it
+    become: true
+    unarchive:
+      src: https://silverstripe-ssorg-releases.s3.amazonaws.com/sssites-ssorg-prod/assets/releases/SilverStripe-cms-v3.7.1.tar.gz
+      dest: /var/www/html
+      remote_src: yes
+    tags: software
+
+  - name: 17/26 Change the permissions on some key files
+    become: true
+    file:
+      path: "/var/www/html/{{ item }}"
+      owner: www-data
+    with_items:
+      - assets
+      - mysite/_config.php
+      - mysite/_config/config.yml
+    tags: software
+
+  - name: 18/26 Fix the timezone in the php.ini file
+    become: true
+    lineinfile:
+      dest: /etc/php/7.0/fpm/php.ini
+      regexp: '^;date.timezone ='
+      line: 'date.timezone = Pacific/Auckland'
+      backrefs: yes
+    tags: software
+
+  - name: 19/26 Fix the max execution time in the php.ini file
+    become: true
+    lineinfile:
+      dest: /etc/php/7.0/fpm/php.ini
+      regexp: '^max_execution_time = 30'
+      line: 'max_execution_time = 300'
+      backrefs: yes
+    tags: software
+
+  - name: 20/26 Fix the socket timeout in the php.ini file
+    become: true
+    lineinfile:
+      dest: /etc/php/7.0/fpm/php.ini
+      regexp: '^default_socket_timeout = 60'
+      line: 'default_socket_timeout = 600'
+      backrefs: yes
+    tags: software
+
+  - name: 21/26 Add a line to the _config.php file
+    become: true
+    lineinfile:
+      dest: /var/www/html/mysite/_config.php
+      line: 'Config::inst()->update(''HtmlEditorField'', ''use_gzip'', false);'
+      insertafter: EOF
+    tags: software
+
+  - name: 22/26 Delete any unnecessary files
+    become: true
+    file:
+      path: /var/www/html/index.nginx-debian.html
+      state: absent
+    tags: software
+
+  - name: 23/26 Start MySQL so we can change some settings
+    become: true
+    service:
+      name: mysql
+      state: started
+    tags: software
+
+  - name: 24/26 Run the file
+    become: true
+    script: files/secure_mysql.sh
+    tags: software
+
+  - name: 25/26 Copy over the nginx configuration file
+    become: true
+    copy:
+      src: nginx.conf
+      dest: /etc/nginx/sites-enabled/default
+    tags: software
+
+  - name: 26/26 Restart services
+    become: true
+    service:
+      name: "{{ item }}"
+      state: reloaded
+    with_items:
+      - nginx
+      - php7.0-fpm
+      - mysql
+    tags: software
+...
